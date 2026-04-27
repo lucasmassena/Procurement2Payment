@@ -12,9 +12,16 @@ Fluxo:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import sys
+
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 import re
 import sqlite3
 import threading

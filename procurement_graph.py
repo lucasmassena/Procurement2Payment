@@ -14,9 +14,9 @@ import sys
 import uuid
 from typing import Annotated, Any, Literal, Optional
 
-if sys.stdout.isatty() and hasattr(sys.stdout, "buffer"):
+if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if sys.stderr.isatty() and hasattr(sys.stderr, "buffer"):
+if hasattr(sys.stderr, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv
