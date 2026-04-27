@@ -12,6 +12,7 @@ Fluxo:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -220,10 +221,20 @@ def _run_step(session: ProcurementSession, payload: Any, client) -> None:
             prompt: str = interrupts[0].value
             log.debug("_run_step prompt=%s", repr(prompt[:80]))
 
-            if "CONFIRMACAO" in prompt.upper():
+            # Tenta detectar pro-forma JSON enviado pelo confirm_with_requester
+            _proforma: dict | None = None
+            if prompt.startswith("{"):
+                try:
+                    _parsed = json.loads(prompt)
+                    if _parsed.get("type") == "PROFORMA":
+                        _proforma = _parsed
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            if _proforma is not None:
                 session.waiting_for = "requester_confirmation"
                 _persist_session(session)
-                _send_confirmation_card(session, prompt, client)
+                _send_proforma_card(session, _proforma, client)
             elif "APROVACAO" in prompt.upper():
                 session.waiting_for = "manager_approval"
                 _persist_session(session)
@@ -267,17 +278,82 @@ def _notify_completion(session: ProcurementSession, values: dict, client) -> Non
               ))
 
 
-def _send_confirmation_card(session: ProcurementSession, prompt: str, client) -> None:
-    """Card de confirmação dos dados — botões Confirmar / Alterar Dados."""
-    blocks = [
+def _send_proforma_card(session: ProcurementSession, proforma: dict, client) -> None:
+    """Card pro-forma rico com categoria, dados extraídos, documentos e pontos de atenção."""
+    categoria    = proforma.get("categoria", "Não classificado")
+    confianca    = proforma.get("categoria_confianca", 0)
+    dados        = proforma.get("dados", {})
+    docs_val     = proforma.get("documentos_validados", [])
+    docs_falt    = proforma.get("documentos_faltantes", [])
+    pontos       = list(proforma.get("pontos_atencao") or [])
+    assinaturas  = proforma.get("assinaturas_ok")
+    signatario   = proforma.get("signatario_vtex")
+    procuracao   = proforma.get("tem_poderes_procuracao")
+    alerta_pj    = proforma.get("alerta_pj")
+
+    # Dados extraídos
+    dados_lines = "\n".join(f"*{k}:* {v}" for k, v in dados.items())
+
+    # Documentos
+    doc_parts: list[str] = []
+    for d in docs_val:
+        doc_parts.append(f":white_check_mark: `{d}`")
+    for d in docs_falt:
+        doc_parts.append(f":x: *Faltando:* `{d}`")
+    docs_text = "\n".join(doc_parts) if doc_parts else "_Nenhum contrato/proposta identificado_"
+
+    # Assinaturas
+    if assinaturas is True:
+        sig_text = ":white_check_mark: Ambas as partes assinaram"
+    elif assinaturas is False:
+        sig_text = ":warning: *Campo de assinatura em branco*"
+    else:
+        sig_text = ":grey_question: Não verificado"
+    if signatario:
+        sig_text += f"\n*Signatário VTEX:* {signatario}"
+    if procuracao and procuracao != "nao_verificavel":
+        sig_text += f"\n*Poderes de Procuração:* {'✅ Confirmado' if procuracao == 'sim' else '⚠️ Não confirmado'}"
+
+    # Pontos de atenção
+    if alerta_pj:
+        pontos.insert(0, alerta_pj)
+    pontos_text = "\n".join(f":warning: {p}" for p in pontos) if pontos else ""
+
+    blocks: list[dict] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": "Confirmação dos Dados do Contrato"},
+            "text": {"type": "plain_text", "text": "Pro-forma da Regularização de Compra"},
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"```{prompt}```"},
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Categoria:*\n{categoria}"},
+                {"type": "mrkdwn", "text": f"*Confiança da IA:*\n{confianca}%"},
+            ],
         },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Dados Extraídos:*\n{dados_lines[:2800]}"},
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Documentos Identificados:*\n{docs_text}"},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Assinaturas:*\n{sig_text}"},
+        },
+    ]
+
+    if pontos_text:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*:warning: Pontos de Atenção:*\n{pontos_text}"},
+        })
+
+    blocks += [
         {"type": "divider"},
         {
             "type": "actions",
@@ -292,16 +368,17 @@ def _send_confirmation_card(session: ProcurementSession, prompt: str, client) ->
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Alterar Dados"},
+                    "text": {"type": "plain_text", "text": "Corrigir / Adicionar Documentos"},
                     "style": "danger",
-                    "action_id": "edit_data_po",
+                    "action_id": "add_documents_po",
                     "value": session.thread_ts,
                 },
             ],
         },
     ]
+
     _post(client, session.channel, session.thread_ts,
-          text="Confirme os dados extraídos do contrato.", blocks=blocks)
+          text="Pro-forma da sua regularização de compra.", blocks=blocks)
 
 
 def _send_approval_card(session: ProcurementSession, prompt: str, client) -> None:
@@ -415,24 +492,25 @@ def _start_flow(event: dict, client, logger) -> None:
             return
         _processed.add(msg_ts)
 
-    # Sem PDF → mostra card de escolha
+    WELCOME_TEXT = (
+        "Oi! Eu sou seu assistente de Procurement para criação de Regularizações de compras "
+        "realizadas com vendors sem o suporte de Procurement e/ou para registro de compras com "
+        "parceiros VTEX. Caso deseje realizar a criação de uma Ordem de Compra de Regularização, "
+        "por favor, insira a documentação obrigatória conforme política atual para que eu possa "
+        "fazer a leitura."
+    )
+
+    # Sem PDF → mostra card de boas-vindas com escolha
     if not pdf_files:
         if msg_ts in _sessions:
             return
         encoded = f"{channel}|{msg_ts}|{user}"
         _post(client, channel, msg_ts,
-              text="Como você gostaria de iniciar a solicitação de compra?",
+              text=WELCOME_TEXT,
               blocks=[
                   {
                       "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": (
-                              ":wave: Olá! Como você gostaria de iniciar a solicitação de compra?\n\n"
-                              ":page_facing_up: *Enviar PDF* — anexe o contrato e extraio os dados automaticamente.\n"
-                              ":pencil: *Preencher Manualmente* — forneça os dados agora mesmo."
-                          ),
-                      },
+                      "text": {"type": "mrkdwn", "text": WELCOME_TEXT},
                   },
                   {
                       "type": "actions",
@@ -456,20 +534,29 @@ def _start_flow(event: dict, client, logger) -> None:
               ])
         return
 
-    # Com PDF → inicia grafo
+    # Com PDF(s) → baixa todos e inicia grafo
     if msg_ts in _sessions:
         return
 
-    _post(client, channel, msg_ts,
-          text=":mag: Recebi o contrato! Estou analisando o PDF... aguarde.")
+    pdf_paths: list[str] = []
+    failed: list[str] = []
+    for pdf_file in pdf_files:
+        try:
+            pdf_paths.append(_download_pdf(pdf_file, client))
+        except Exception as e:
+            logger.exception("Falha ao baixar %s", pdf_file.get("name"))
+            failed.append(pdf_file.get("name", "arquivo"))
 
-    try:
-        pdf_path = _download_pdf(pdf_files[0], client)
-    except Exception as e:
-        logger.exception("Falha ao baixar PDF")
-        _post(client, channel, msg_ts,
-              text=f":x: Não consegui baixar o arquivo: `{e}`")
+    if not pdf_paths:
+        _post(client, channel, msg_ts, text=f":x: Não consegui baixar nenhum arquivo PDF.")
         return
+    if failed:
+        _post(client, channel, msg_ts,
+              text=f":warning: Não consegui baixar: {', '.join(failed)}. Continuando com os demais.")
+
+    n = len(pdf_paths)
+    _post(client, channel, msg_ts,
+          text=f":mag: Recebi {n} documento(s)! Estou analisando... aguarde.")
 
     session = ProcurementSession(
         config={"configurable": {"thread_id": f"slack-{channel}-{msg_ts}"}},
@@ -490,10 +577,11 @@ def _start_flow(event: dict, client, logger) -> None:
     except Exception:
         pass
 
+    names = ", ".join(os.path.basename(p) for p in pdf_paths)
     initial_state: AgentState = {
         "messages": [],
-        "user_request": text or f"Contrato enviado via Slack: {pdf_files[0]['name']}",
-        "pdf_path": pdf_path,
+        "user_request": text or f"Documentos enviados via Slack: {names}",
+        "pdf_paths": pdf_paths,
         "contract_text": "",
         "contract_data": {},
         "missing_fields": [],
@@ -502,6 +590,11 @@ def _start_flow(event: dict, client, logger) -> None:
         "approval_status": None,
         "po_id": None,
         "error_message": None,
+        "is_discarded": False,
+        "tipo_regularizacao": None,
+        "assinaturas_ok": None,
+        "pontos_atencao": None,
+        "documentos_identificados": None,
         "criado_por": criado_por,
         "criado_por_email": criado_por_email,
         "thread_url": thread_url,
@@ -650,7 +743,7 @@ def handle_manual_fill(ack, action: dict, client, body) -> None:
     initial_state: AgentState = {
         "messages": [],
         "user_request": "Solicitação de compra manual via Slack",
-        "pdf_path": None,
+        "pdf_paths": [],
         "contract_text": "",
         "contract_data": {},
         "missing_fields": [],
@@ -659,6 +752,11 @@ def handle_manual_fill(ack, action: dict, client, body) -> None:
         "approval_status": None,
         "po_id": None,
         "error_message": None,
+        "is_discarded": False,
+        "tipo_regularizacao": None,
+        "assinaturas_ok": None,
+        "pontos_atencao": None,
+        "documentos_identificados": None,
         "criado_por": criado_por,
         "criado_por_email": criado_por_email,
         "thread_url": thread_url,
@@ -744,6 +842,44 @@ def handle_edit_data(ack, action: dict, client, body) -> None:
     _persist_session(session)
     _post(client, session.channel, session.thread_ts,
           text=":pencil: Quais dados precisam ser alterados? Responda nesta thread.")
+
+
+# ==============================================================================
+# ACTIONS: corrigir / adicionar documentos
+# ==============================================================================
+
+@app.action("add_documents_po")
+def handle_add_documents(ack, action: dict, client, body) -> None:
+    ack()
+    thread_ts = action["value"]
+    session   = _sessions.get(thread_ts)
+
+    log.debug("[ACTION add_docs] thread_ts=%s found=%s", thread_ts, session is not None)
+
+    if not session:
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            text=":warning: Esta solicitação não está mais ativa. Envie os documentos novamente.",
+        )
+        return
+
+    client.chat_update(
+        channel=body["channel"]["id"],
+        ts=body["message"]["ts"],
+        text="Aguardando correção ou documentos adicionais.",
+        blocks=[{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":pencil: *Correção solicitada* por <@" + body["user"]["id"] + ">",
+            },
+        }],
+    )
+
+    session.waiting_for = "edit_data"
+    _persist_session(session)
+    _post(client, session.channel, session.thread_ts,
+          text=":pencil: Quais dados precisam ser corrigidos? Você também pode enviar documentos adicionais nesta thread.")
 
 
 # ==============================================================================

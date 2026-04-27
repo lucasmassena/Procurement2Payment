@@ -148,6 +148,10 @@ def _migrate_db() -> None:
         "purchase_number TEXT",
         "area_solicitante TEXT",
         "centro_custo TEXT",
+        "tipo_regularizacao TEXT",
+        "assinaturas_ok INTEGER",
+        "pontos_atencao TEXT",
+        "documentos_identificados TEXT",
     ]
     with get_conn() as conn:
         for col_def in new_cols:

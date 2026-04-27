@@ -1,19 +1,19 @@
 """
-MVP — Automação de Procurement (Purchase Requisition)
-======================================================
-Stack : LangGraph + Gemini 2.0 Flash (structured output) + SQLite + MemorySaver
+Procurement Bot — Regularização e Parcerias VTEX
+=================================================
+Stack: LangGraph + Gemini 2.0 Flash (structured output) + SQLite + SqliteSaver
 """
 
 from __future__ import annotations
 
 import io
+import json
 import os
 import sqlite3
 import sys
 import uuid
 from typing import Annotated, Any, Literal, Optional
 
-# Forca UTF-8 em stdout/stderr apenas quando rodando em terminal Windows (CP1252)
 if sys.stdout.isatty() and hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 if sys.stderr.isatty() and hasattr(sys.stderr, "buffer"):
@@ -22,7 +22,6 @@ if sys.stderr.isatty() and hasattr(sys.stderr, "buffer"):
 import pdfplumber
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -35,9 +34,8 @@ from typing_extensions import TypedDict
 # CONFIGURAÇÃO
 # ==============================================================================
 
-# Em produção mova para variável de ambiente / .env
-GEMINI_API_KEY = "GEMINI_KEY_REMOVED"
-MODEL = "gemini-2.5-flash"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "GEMINI_KEY_REMOVED")
+MODEL = "gemini-2.0-flash"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "procurement.db")
 
@@ -49,158 +47,141 @@ REQUIRED_FIELDS: list[str] = [
     "condicao_pagamento",
 ]
 
+CATEGORIES: list[str] = [
+    "Vendor/Supplier",
+    "Partnership - SIs implementing POC",
+    "Partnership - commission payment",
+    "Partnership - Prime",
+    "Partnership - others",
+    "Sponsorship",
+    "Legal and Litigation Service Providers/Law Firms",
+]
+
+# Documentos obrigatórios adicionais por categoria
+DOCS_REQUIRED_BY_CATEGORY: dict[str, list[str]] = {
+    "Partnership - commission payment": ["MPA - Master Partner Agreement"],
+}
+
+# Tipos de documento que sozinhos não servem como base para uma PO
+DISCARD_DOC_TYPES: set[str] = {"invoice", "nota_fiscal", "recibo", "boleto"}
+
 
 # ==============================================================================
-# SCHEMA DE EXTRAÇÃO (Pydantic — usado com .with_structured_output())
+# SCHEMA DE EXTRAÇÃO (Pydantic)
 # ==============================================================================
 
 class ContractData(BaseModel):
-    """
-    Schema de extração estruturada do contrato de fornecimento.
-    Todos os campos são Optional: o modelo preenche apenas o que encontrar
-    explicitamente no texto. Se não encontrar, retorna None.
-    """
+    """Schema de extração estruturada — Gemini preenche apenas o que encontrar explicitamente."""
 
-    # ── Identificação do Fornecedor ─────────────────────────────────────────
+    # ── Identificação do Fornecedor ──────────────────────────────────────────
     razao_social: Optional[str] = Field(
-        None,
-        description=(
-            "Razão Social ou nome completo do FORNECEDOR/CONTRATADO — "
-            "conforme consta no preâmbulo do contrato. "
-            "Pode ser pessoa física ou jurídica."
-        ),
+        None, description="Razão Social ou nome completo do FORNECEDOR/CONTRATADO conforme preâmbulo do contrato.",
     )
     cnpj: Optional[str] = Field(
-        None,
-        description=(
-            "CNPJ ou CPF do fornecedor — apenas dígitos numéricos, sem pontos/traços/barras."
-        ),
+        None, description="CNPJ ou CPF do fornecedor — apenas dígitos numéricos, sem pontos/traços/barras.",
     )
-    fornecedor_pais: Optional[str] = Field(
-        None,
-        description="País de origem do fornecedor, conforme consta no contrato.",
-    )
+    fornecedor_pais: Optional[str] = Field(None, description="País de origem do fornecedor conforme consta no contrato.")
     alerta_pj: Optional[str] = Field(
         None,
         description=(
-            "Se a primeira palavra da Razão Social for um nome próprio humano "
-            "(ex: 'Victor', 'Maria', 'João'), preencha com 'ALERTA: possível risco PJ/Contractor — "
-            "fornecedor com nome de pessoa física'. Caso contrário, deixe vazio (None)."
+            "Se a primeira palavra da Razão Social for nome próprio humano (ex: 'Victor', 'Maria'), "
+            "preencha com 'ALERTA: possível risco PJ/Contractor'. Caso contrário, None."
         ),
     )
 
     # ── Contratante (VTEX) ───────────────────────────────────────────────────
     contratante_nome: Optional[str] = Field(
-        None,
-        description=(
-            "Nome exato da entidade VTEX identificada como CONTRATANTE ou COMPRADORA "
-            "no preâmbulo da primeira página."
-        ),
+        None, description="Nome exato da entidade VTEX identificada como CONTRATANTE no preâmbulo.",
     )
     contratante_cnpj: Optional[str] = Field(
-        None,
-        description="CNPJ/Tax ID da entidade VTEX contratante — apenas dígitos numéricos.",
+        None, description="CNPJ/Tax ID da entidade VTEX contratante — apenas dígitos numéricos.",
     )
 
     # ── Valores e Moeda ──────────────────────────────────────────────────────
     moeda: Optional[str] = Field(
-        None,
-        description=(
-            "Moeda EXPLICITAMENTE citada no corpo principal do contrato "
-            "(ex: 'BRL', 'USD', 'EUR'). Proibido inferir pelo país."
-        ),
+        None, description="Moeda EXPLICITAMENTE citada no contrato (ex: BRL, USD, EUR). Nunca inferir pelo país.",
     )
     valor_total: Optional[float] = Field(
-        None,
-        description=(
-            "Valor total do contrato — número decimal sem símbolo de moeda. "
-            "Converta abreviações: '90 mil' = 90000.0, '1,5 milhão' = 1500000.0."
-        ),
+        None, description="Valor total do contrato — número decimal sem símbolo. '90 mil' = 90000.0.",
     )
     descricao_itens: Optional[str] = Field(
-        None,
-        description=(
-            "Descrição dos itens/serviços negociados com valores e quantidades. "
-            "Indique se há menção explícita de inclusão ou exclusão de impostos."
-        ),
+        None, description="Descrição dos itens/serviços com valores e quantidades.",
     )
 
     # ── Datas e Vigência ─────────────────────────────────────────────────────
     data_inicio: Optional[str] = Field(
-        None,
-        description=(
-            "Data de início do serviço exatamente como escrita no contrato. "
-            "Se for 'data da assinatura', escreva isso. NÃO calcule nem infira."
-        ),
+        None, description="Data de início exatamente como escrita no contrato. Nunca calcule.",
     )
     data_termino: Optional[str] = Field(
-        None,
-        description=(
-            "Data de término ou prazo de vigência exatamente como escrito. "
-            "Se disser '12 meses', extraia '12 meses a partir do início'. NÃO calcule a data exata."
-        ),
+        None, description="Data de término ou prazo de vigência exatamente como escrito.",
     )
 
-    # ── Escopo ───────────────────────────────────────────────────────────────
-    escopo: Optional[str] = Field(
-        None,
-        description="Escopo ou objeto do contrato — resumo claro e objetivo do que está sendo contratado.",
-    )
-
-    # ── Pagamento ────────────────────────────────────────────────────────────
-    condicao_pagamento: Optional[str] = Field(
-        None,
-        description="Condição/prazo de pagamento (ex: '30 dias após fatura', 'a vista', '30/60/90 dias').",
-    )
-    frequencia_pagamento: Optional[str] = Field(
-        None,
-        description="Frequência de faturamento/pagamento (ex: mensal, anual, trimestral, parcela única).",
-    )
+    # ── Escopo e Pagamento ───────────────────────────────────────────────────
+    escopo: Optional[str] = Field(None, description="Escopo ou objeto do contrato — resumo do que está sendo contratado.")
+    condicao_pagamento: Optional[str] = Field(None, description="Condição/prazo de pagamento.")
+    frequencia_pagamento: Optional[str] = Field(None, description="Frequência de faturamento (ex: mensal, anual).")
 
     # ── Contato ──────────────────────────────────────────────────────────────
-    contato_nome: Optional[str] = Field(
-        None,
-        description="Nome do contato/representante do fornecedor, se disponível no contrato.",
-    )
-    contato_email: Optional[str] = Field(
-        None,
-        description="E-mail do contato do fornecedor, se disponível.",
-    )
+    contato_nome: Optional[str] = Field(None, description="Nome do contato/representante do fornecedor.")
+    contato_email: Optional[str] = Field(None, description="E-mail do contato do fornecedor.")
 
-    # ── Assinaturas ──────────────────────────────────────────────────────────
-    assinaturas: Optional[str] = Field(
+    # ── Classificação e Compliance ───────────────────────────────────────────
+    categoria: Optional[str] = Field(
         None,
         description=(
-            "Status das assinaturas no bloco final do contrato. "
-            "Indique explicitamente: quem assinou (Contratante e/ou Fornecedor) "
-            "e se há campos em branco para alguma das partes."
+            "Categoria da solicitação. Escolha EXATAMENTE UMA entre: "
+            "Vendor/Supplier | Partnership - SIs implementing POC | "
+            "Partnership - commission payment | Partnership - Prime | "
+            "Partnership - others | Sponsorship | "
+            "Legal and Litigation Service Providers/Law Firms"
+        ),
+    )
+    categoria_confianca: Optional[int] = Field(
+        None, description="Confiança na classificação da categoria, de 0 a 100.",
+    )
+    documentos_identificados: Optional[list[str]] = Field(
+        None,
+        description=(
+            "Lista de tipos de documentos identificados no conjunto enviado. "
+            "Valores possíveis: contrato | proposta_comercial | mpa | invoice | nota_fiscal | recibo | boleto | outro"
+        ),
+    )
+    assinaturas: Optional[str] = Field(
+        None, description="Status das assinaturas: quem assinou e se há campos em branco.",
+    )
+    assinaturas_ok: Optional[bool] = Field(
+        None,
+        description="True somente se AMBAS as partes (VTEX e Fornecedor) assinaram. False se qualquer campo estiver em branco.",
+    )
+    signatario_vtex: Optional[str] = Field(
+        None, description="Nome do signatário do lado da VTEX identificado no bloco de assinaturas.",
+    )
+    tem_poderes_procuracao: Optional[str] = Field(
+        None,
+        description=(
+            "Se o signatário VTEX possui poderes de procuração nos documentos analisados. "
+            "Valores: 'sim' | 'nao' | 'nao_verificavel'"
+        ),
+    )
+    pontos_atencao: Optional[list[str]] = Field(
+        None,
+        description=(
+            "Lista de pontos de atenção identificados. Ex: campo de assinatura em branco, "
+            "MPA ausente para comissão, signatário sem procuração verificável, risco PJ."
         ),
     )
 
 
 # ==============================================================================
-# UTILITÁRIO DE LEITURA DE PDF
+# UTILITÁRIOS DE PDF
 # ==============================================================================
 
 def extract_text_from_pdf(file_path: str) -> str:
-    """
-    Extrai o texto de todas as páginas de um PDF usando pdfplumber.
-
-    pdfplumber lida melhor que pypdf com layouts complexos (tabelas, multi-coluna),
-    sendo mais adequado para contratos comerciais.
-
-    Args:
-        file_path: Caminho local do arquivo PDF (ex: /tmp/contrato_slack.pdf).
-
-    Returns:
-        Texto concatenado de todas as páginas, ou string vazia se falhar.
-    """
     texts: list[str] = []
     try:
         with pdfplumber.open(file_path) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
-                # Sanitiza chars fora do CP1252 para evitar erros de encoding no Windows
                 text = text.encode("cp1252", errors="replace").decode("cp1252")
                 if text.strip():
                     texts.append(text)
@@ -209,37 +190,53 @@ def extract_text_from_pdf(file_path: str) -> str:
     return "\n\n".join(texts)
 
 
+def extract_texts_from_pdfs(pdf_paths: list[str]) -> str:
+    """Extrai e combina texto de múltiplos PDFs com separador indicando cada documento."""
+    all_texts: list[str] = []
+    for i, path in enumerate(pdf_paths, 1):
+        text = extract_text_from_pdf(path)
+        if text:
+            filename = os.path.basename(path)
+            all_texts.append(f"=== DOCUMENTO {i}: {filename} ===\n{text}")
+    return "\n\n".join(all_texts)
+
+
 # ==============================================================================
 # STATE
 # ==============================================================================
 
 class AgentState(TypedDict):
-    """Estado compartilhado entre todos os nós do grafo."""
-
     messages: Annotated[list[BaseMessage], add_messages]
 
     # Inputs
-    user_request: str          # Mensagem do usuário no Slack / terminal
-    pdf_path: Optional[str]    # Caminho local do PDF baixado do Slack (None se texto direto)
-    contract_text: str         # Texto bruto extraído do PDF ou fornecido diretamente
+    user_request: str
+    pdf_paths: list[str]        # Suporta múltiplos documentos
+    contract_text: str
 
-    # Dados extraídos e validados
-    contract_data: dict[str, Any]   # Campos do ContractData já extraídos (acumulados)
-    missing_fields: list[str]       # Campos obrigatórios ainda ausentes
+    # Dados extraídos
+    contract_data: dict[str, Any]
+    missing_fields: list[str]
+
+    # Campos de compliance (persistidos no banco)
+    tipo_regularizacao: Optional[str]
+    assinaturas_ok: Optional[bool]
+    pontos_atencao: Optional[str]           # JSON list serializado
+    documentos_identificados: Optional[str] # JSON list serializado
+    is_discarded: bool
 
     # Controle de fluxo
-    supplier_status:    Optional[str]   # "active" | "blocked" | "not_found"
-    confirmation_status: Optional[str] # "confirmed" | "edit" | None
-    approval_status:    Optional[str]   # "pending" | "approved" | "rejected"
+    supplier_status:     Optional[str]   # "active" | "blocked" | "not_found"
+    confirmation_status: Optional[str]   # "confirmed" | "edit"
+    approval_status:     Optional[str]   # "pending" | "approved" | "rejected"
 
     # Resultado
     po_id: Optional[str]
     error_message: Optional[str]
 
     # Rastreabilidade
-    criado_por: Optional[str]        # Nome do solicitante no Slack
-    criado_por_email: Optional[str]  # Email do solicitante no Slack
-    thread_url: Optional[str]        # Link da thread do Slack onde a PO foi criada
+    criado_por: Optional[str]
+    criado_por_email: Optional[str]
+    thread_url: Optional[str]
 
 
 # ==============================================================================
@@ -247,13 +244,7 @@ class AgentState(TypedDict):
 # ==============================================================================
 
 def receive_input_and_document(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 1 — Ponto de entrada.
-    Registra a solicitação e inicializa todos os campos de controle.
-    """
     print("\n[NODE] receive_input_and_document")
-    print(f"  Solicitação: {state['user_request'][:80]}...")
-
     return {
         "messages": [HumanMessage(content=state["user_request"])],
         "contract_data": {},
@@ -263,6 +254,11 @@ def receive_input_and_document(state: AgentState) -> dict[str, Any]:
         "approval_status": "pending",
         "po_id": None,
         "error_message": None,
+        "is_discarded": False,
+        "tipo_regularizacao": None,
+        "assinaturas_ok": None,
+        "pontos_atencao": None,
+        "documentos_identificados": None,
     }
 
 
@@ -271,36 +267,31 @@ SUPPLEMENT_MARKER = "\n\n[Complemento do usuário]\n"
 
 def extract_and_validate_data(state: AgentState) -> dict[str, Any]:
     """
-    Nó 2 — Extração estruturada via Gemini + validação dos campos obrigatórios.
-
-    Dois modos de operação:
-    - Primeira extração: processa o texto completo do PDF.
-    - Follow-up (após resposta do usuário no Slack): extrai apenas os campos
-      faltantes a partir da resposta do usuário, preservando o que já foi extraído.
+    Extração estruturada via Gemini + classificação de categoria + validação de compliance.
+    Suporta múltiplos PDFs e modo follow-up para campos faltantes.
     """
     print("\n[NODE] extract_and_validate_data")
 
-    pdf_path: Optional[str] = state.get("pdf_path")
+    pdf_paths: list[str] = state.get("pdf_paths") or []
     contract_text: str = state.get("contract_text", "").strip()
     existing: dict[str, Any] = state.get("contract_data") or {}
     missing_before: list[str] = state.get("missing_fields") or []
 
-    # ── 1. Resolução da fonte de texto e modo de extração ─────────────────────
+    # ── Resolução da fonte de texto ───────────────────────────────────────────
     if SUPPLEMENT_MARKER in contract_text:
-        # Follow-up: o usuário respondeu com os dados faltantes.
-        # Extrai apenas da parte nova (resposta do usuário), preservando dados já coletados.
         source_text = contract_text.split(SUPPLEMENT_MARKER)[-1].strip()
         is_supplement = True
-        print(f"  Modo follow-up. Extraindo da resposta do usuário: '{source_text[:80]}'")
-    elif pdf_path and not contract_text:
-        print(f"  Extraindo texto do PDF: {pdf_path}")
-        contract_text = extract_text_from_pdf(pdf_path)
+        print(f"  Modo follow-up: '{source_text[:80]}'")
+    elif pdf_paths and not contract_text:
+        print(f"  Extraindo texto de {len(pdf_paths)} PDF(s)...")
+        contract_text = extract_texts_from_pdfs(pdf_paths)
         if not contract_text:
-            print("  [AVISO] PDF sem texto extraivel.")
+            print("  [AVISO] PDFs sem texto extraível.")
             return {
                 "contract_text": "",
                 "contract_data": existing,
                 "missing_fields": REQUIRED_FIELDS,
+                "is_discarded": False,
             }
         source_text = contract_text
         is_supplement = False
@@ -309,152 +300,191 @@ def extract_and_validate_data(state: AgentState) -> dict[str, Any]:
         is_supplement = False
 
     if not source_text:
-        print("  [AVISO] Nenhum texto disponivel para extração.")
-        return {
-            "contract_data": existing,
-            "missing_fields": REQUIRED_FIELDS,
-        }
+        return {"contract_data": existing, "missing_fields": REQUIRED_FIELDS, "is_discarded": False}
 
-    # ── 2. Prompt adaptado ao modo ────────────────────────────────────────────
+    # ── Prompt ────────────────────────────────────────────────────────────────
     llm = ChatGoogleGenerativeAI(model=MODEL, google_api_key=GEMINI_API_KEY, temperature=0)
     structured_llm = llm.with_structured_output(ContractData)
 
     SYSTEM_CONTEXT = (
-        "Você é um Especialista em Extração de Dados de Contratos de Procurement da VTEX. "
-        "Sua função é analisar detalhadamente o documento e extrair as informações chave com precisão absoluta.\n\n"
+        "Você é um Especialista em Compliance e Extração de Dados de Contratos da VTEX.\n"
+        "Analise os documentos e execute TODAS as tarefas abaixo:\n\n"
+        "TAREFA 1 — CLASSIFICAÇÃO DE CATEGORIA\n"
+        "Classifique em UMA categoria (campo `categoria`):\n"
+        "  Vendor/Supplier | Partnership - SIs implementing POC | "
+        "Partnership - commission payment | Partnership - Prime | "
+        "Partnership - others | Sponsorship | "
+        "Legal and Litigation Service Providers/Law Firms\n"
+        "Indique a confiança (0-100) em `categoria_confianca`.\n\n"
+        "TAREFA 2 — IDENTIFICAÇÃO DE DOCUMENTOS\n"
+        "Liste todos os documentos em `documentos_identificados`:\n"
+        "  contrato | proposta_comercial | mpa | invoice | nota_fiscal | recibo | boleto | outro\n\n"
+        "TAREFA 3 — VALIDAÇÃO DE ASSINATURAS\n"
+        "Para contratos e propostas comerciais:\n"
+        "  - `assinaturas_ok` = true somente se AMBAS as partes (VTEX e Fornecedor) assinaram.\n"
+        "  - `assinaturas_ok` = false se qualquer campo de assinatura estiver em branco.\n"
+        "  - Identifique o signatário VTEX em `signatario_vtex`.\n\n"
+        "TAREFA 4 — VERIFICAÇÃO DE PROCURAÇÃO VTEX\n"
+        "Com base nos documentos, indique em `tem_poderes_procuracao`:\n"
+        "  'sim' | 'nao' | 'nao_verificavel'\n\n"
+        "TAREFA 5 — PONTOS DE ATENÇÃO\n"
+        "Liste em `pontos_atencao` todos os alertas encontrados:\n"
+        "  assinaturas em branco, documentos obrigatórios ausentes, risco PJ, etc.\n\n"
         "REGRAS ABSOLUTAS:\n"
-        "1. FONTE ÚNICA DA VERDADE: O contrato/proposta principal é SEMPRE sua única fonte. "
-        "É TERMINANTEMENTE PROIBIDO extrair valores de arquivos secundários (NF, invoice, boleto, recibo). "
-        "Se uma informação não estiver explícita, retorne None.\n"
-        "2. TOLERÂNCIA ZERO PARA INFERÊNCIAS: Proibido deduzir dados, calcular prazos ou assumir premissas. "
-        "A extração deve ser LITERAL (exatamente como está escrito).\n"
-        "3. CNPJ: apenas dígitos numéricos, sem pontos/traços/barras.\n"
-        "4. valor_total: número decimal sem símbolo de moeda. Converta abreviações ('90 mil'=90000.0).\n"
-        "5. Moeda: identifique EXPLICITAMENTE no corpo do contrato. Proibido inferir pelo país.\n"
-        "6. Datas: extraia LITERALMENTE como escrito. NÃO calcule datas.\n"
-        "7. Assinaturas: verifique o bloco final — informe quem assinou e se há campos em branco.\n"
-        "8. Alerta PJ: se a primeira palavra do nome do fornecedor for nome próprio humano, gere o alerta.\n"
-        "9. Contratante (VTEX): olhe EXCLUSIVAMENTE o preâmbulo da primeira página.\n"
+        "1. FONTE ÚNICA: Extraia valores APENAS do contrato/proposta principal. "
+        "NUNCA de NF, invoice, recibo ou boleto.\n"
+        "2. SEM INFERÊNCIAS: Extraia literalmente. Nunca calcule datas ou deduza dados.\n"
+        "3. CNPJ: apenas dígitos numéricos.\n"
+        "4. Moeda: identifique EXPLICITAMENTE no corpo do contrato.\n"
     )
 
     if is_supplement:
-        if missing_before:
-            campos = ", ".join(f.replace("_", " ") for f in missing_before)
-            context = f"Extraia especificamente os campos: {campos}."
-        else:
-            context = "Extraia todos os campos que o usuário mencionou."
+        campos = ", ".join(f.replace("_", " ") for f in missing_before) if missing_before else "todos os campos"
         prompt = (
             f"{SYSTEM_CONTEXT}\n"
-            f"O usuário forneceu os seguintes dados diretamente:\n\n"
-            f'"{source_text}"\n\n'
-            f"{context}\n"
-            "Deixe None apenas campos que o usuário não mencionou."
+            f"O usuário forneceu dados diretamente:\n\n\"{source_text}\"\n\n"
+            f"Extraia especificamente: {campos}. Deixe None para campos não mencionados."
         )
     else:
         prompt = (
             f"{SYSTEM_CONTEXT}\n"
-            "Leia o texto abaixo e extraia todos os dados do contrato de fornecimento.\n"
-            "Preencha APENAS campos explicitamente presentes no texto. "
-            "Retorne None para campos ausentes ou ambíguos.\n\n"
-            f"TEXTO DO CONTRATO:\n{source_text}"
+            "Leia os documentos abaixo e extraia todos os dados.\n"
+            "Preencha APENAS campos explicitamente presentes. Retorne None para ausentes.\n\n"
+            f"DOCUMENTOS:\n{source_text}"
         )
 
     result: ContractData = structured_llm.invoke(prompt)
 
-    # ── 3. Merge incremental — dados anteriores nunca são sobrescritos por None ─
-    newly_extracted: dict[str, Any] = {
-        k: v for k, v in result.model_dump().items() if v is not None and v != ""
-    }
-    merged: dict[str, Any] = {**existing, **newly_extracted}
+    # ── Merge incremental ─────────────────────────────────────────────────────
+    newly = {k: v for k, v in result.model_dump().items() if v is not None and v != "" and v != []}
+    merged: dict[str, Any] = {**existing, **newly}
 
-    # ── 4. Validação ──────────────────────────────────────────────────────────
-    missing: list[str] = [f for f in REQUIRED_FIELDS if not merged.get(f)]
+    # ── Verificação de descarte ───────────────────────────────────────────────
+    docs: list[str] = merged.get("documentos_identificados") or []
+    is_discarded = bool(docs) and all(d in DISCARD_DOC_TYPES for d in docs)
 
+    # ── Pontos de atenção adicionais por categoria ────────────────────────────
+    pontos: list[str] = list(merged.get("pontos_atencao") or [])
+    categoria = merged.get("categoria", "")
+    for req_doc in DOCS_REQUIRED_BY_CATEGORY.get(categoria, []):
+        has_doc = any("mpa" in d.lower() for d in docs) if "mpa" in req_doc.lower() else False
+        if not has_doc:
+            warning = f"Documento obrigatório ausente para '{categoria}': {req_doc}"
+            if warning not in pontos:
+                pontos.append(warning)
+    if pontos:
+        merged["pontos_atencao"] = pontos
+
+    # ── Validação de campos obrigatórios ──────────────────────────────────────
+    missing: list[str] = [] if is_discarded else [f for f in REQUIRED_FIELDS if not merged.get(f)]
+
+    print(f"  Categoria: {merged.get('categoria')} ({merged.get('categoria_confianca')}%)")
+    print(f"  Docs: {docs} | Descarte: {is_discarded} | Assinaturas OK: {merged.get('assinaturas_ok')}")
     if missing:
-        print(f"  Campos ainda faltantes: {missing}")
-    else:
-        print(f"  Extração completa: razao_social={merged.get('razao_social')}, "
-              f"cnpj={merged.get('cnpj')}, valor_total={merged.get('valor_total')}")
+        print(f"  Campos faltantes: {missing}")
 
     return {
         "contract_text": contract_text,
         "contract_data": merged,
         "missing_fields": missing,
+        "is_discarded": is_discarded,
+        "tipo_regularizacao": merged.get("categoria"),
+        "assinaturas_ok": merged.get("assinaturas_ok"),
+        "pontos_atencao": json.dumps(merged.get("pontos_atencao") or [], ensure_ascii=False),
+        "documentos_identificados": json.dumps(docs, ensure_ascii=False),
+    }
+
+
+def discard_documents(_state: AgentState) -> dict[str, Any]:
+    """Descarta fluxo quando os documentos enviados são apenas NF/invoice/recibo."""
+    print("\n[NODE] discard_documents")
+    reason = "Documentos enviados são apenas NF/invoice/recibo — não são aceitos como base para PO."
+    return {
+        "error_message": reason,
+        "messages": [AIMessage(content=reason)],
     }
 
 
 def human_in_the_loop_missing_info(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 3 — Interrupção para coletar informações faltantes do usuário.
-
-    `interrupt()` pausa o grafo. Retoma via Command(resume=<resposta do usuário>).
-    A resposta é anexada ao contract_text com SUPPLEMENT_MARKER para que
-    extract_and_validate_data saiba que é um follow-up e use extração dirigida.
-    """
     print("\n[NODE] human_in_the_loop_missing_info")
-
-    campos_fmt = "\n".join(
-        f"• {f.replace('_', ' ').title()}" for f in state["missing_fields"]
-    )
+    campos_fmt = "\n".join(f"• {f.replace('_', ' ').title()}" for f in state["missing_fields"])
     prompt = (
         f"Não consegui identificar os seguintes dados no contrato:\n{campos_fmt}\n\n"
         "Por favor, responda nesta thread com essas informações para continuar o processo."
     )
-    print(f"  {prompt}")
-
     user_response: str = interrupt(prompt)
-
     return {
-        "messages": [
-            AIMessage(content=prompt),
-            HumanMessage(content=user_response),
-        ],
+        "messages": [AIMessage(content=prompt), HumanMessage(content=user_response)],
         "contract_text": state.get("contract_text", "") + SUPPLEMENT_MARKER + user_response,
     }
 
 
 def confirm_with_requester(state: AgentState) -> dict[str, Any]:
     """
-    Nó 3.5 — Mostra os dados extraídos ao solicitante para confirmação antes
-    de enviar ao gerente. Permite correções via 'edit:<texto>'.
+    Interrompe o fluxo para exibir o Pro-forma ao solicitante.
+    Serializa os dados como JSON com type='PROFORMA' para o bot construir o card rico.
     """
     print("\n[NODE] confirm_with_requester")
 
     data = state["contract_data"]
     valor = float(data.get("valor_total") or 0)
-    valor_fmt = f"{data.get('moeda', 'BRL')} {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    moeda = data.get("moeda", "BRL")
+    valor_fmt = f"{moeda} {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     def _f(key: str, default: str = "Não informado") -> str:
         return str(data.get(key) or default)
 
-    summary = (
-        "=== CONFIRMACAO DOS DADOS ===\n"
-        f"  Fornecedor        : {_f('razao_social')}\n"
-        f"  CNPJ Fornecedor   : {_f('cnpj')}\n"
-        f"  Pais              : {_f('fornecedor_pais')}\n"
-        f"  Contratante (VTEX): {_f('contratante_nome')}\n"
-        f"  CNPJ Contratante  : {_f('contratante_cnpj')}\n"
-        f"  Moeda             : {_f('moeda')}\n"
-        f"  Valor Total       : {valor_fmt}\n"
-        f"  Inicio            : {_f('data_inicio')}\n"
-        f"  Termino           : {_f('data_termino')}\n"
-        f"  Cond. Pagamento   : {_f('condicao_pagamento')}\n"
-        f"  Frequencia        : {_f('frequencia_pagamento')}\n"
-        f"  Escopo            : {_f('escopo')}\n"
-        f"  Assinaturas       : {_f('assinaturas')}\n"
-        + (f"  [ALERTA PJ] {data['alerta_pj']}\n" if data.get("alerta_pj") else "")
-        + "=============================\n"
-        "Os dados estao corretos?"
-    )
-    print(f"  {summary}")
+    # Documentos
+    try:
+        docs_list: list[str] = json.loads(state.get("documentos_identificados") or "[]")
+    except Exception:
+        docs_list = []
 
-    decision: str = interrupt(summary)
+    docs_validados = [d for d in docs_list if d not in DISCARD_DOC_TYPES]
+    docs_faltantes: list[str] = []
+    for req_doc in DOCS_REQUIRED_BY_CATEGORY.get(data.get("categoria", ""), []):
+        has_doc = any("mpa" in d.lower() for d in docs_list) if "mpa" in req_doc.lower() else False
+        if not has_doc:
+            docs_faltantes.append(req_doc)
+
+    # Pontos de atenção
+    try:
+        pontos: list[str] = json.loads(state.get("pontos_atencao") or "[]")
+    except Exception:
+        pontos = []
+
+    proforma = {
+        "type": "PROFORMA",
+        "categoria": data.get("categoria") or "Não classificado",
+        "categoria_confianca": data.get("categoria_confianca") or 0,
+        "dados": {
+            "Fornecedor": _f("razao_social"),
+            "CNPJ": _f("cnpj"),
+            "País": _f("fornecedor_pais"),
+            "Contratante (VTEX)": _f("contratante_nome"),
+            "Moeda": _f("moeda"),
+            "Valor Total": valor_fmt,
+            "Início": _f("data_inicio"),
+            "Término": _f("data_termino"),
+            "Pagamento": _f("condicao_pagamento"),
+            "Frequência": _f("frequencia_pagamento"),
+            "Escopo": _f("escopo"),
+        },
+        "assinaturas_ok": data.get("assinaturas_ok"),
+        "signatario_vtex": data.get("signatario_vtex"),
+        "tem_poderes_procuracao": data.get("tem_poderes_procuracao"),
+        "documentos_validados": docs_validados,
+        "documentos_faltantes": docs_faltantes,
+        "pontos_atencao": pontos,
+        "alerta_pj": data.get("alerta_pj"),
+    }
+
+    decision: str = interrupt(json.dumps(proforma, ensure_ascii=False))
 
     if decision.strip().lower() == "confirmed":
         print("  Dados confirmados pelo solicitante.")
         return {"confirmation_status": "confirmed"}
 
-    # Usuário quer editar: decision vem como "edit:<texto da correção>"
     edit_text = decision.removeprefix("edit:").strip()
     print(f"  Solicitante pediu alteração: {edit_text}")
     return {
@@ -465,42 +495,33 @@ def confirm_with_requester(state: AgentState) -> dict[str, Any]:
 
 
 def check_supplier(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 4 — Consulta o cadastro de fornecedores no SQLite pelo CNPJ.
-    Retorna: "active" | "blocked" | "not_found".
-    """
     print("\n[NODE] check_supplier")
-
     cnpj = state["contract_data"].get("cnpj", "")
-    print(f"  Consultando CNPJ {cnpj}...")
-
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT status FROM suppliers WHERE cnpj = ?", (cnpj,)
-        ).fetchone()
-
+        row = conn.execute("SELECT status FROM suppliers WHERE cnpj = ?", (cnpj,)).fetchone()
     supplier_status = row[0] if row else "not_found"
-    print(f"  Status: {supplier_status}")
-
+    print(f"  CNPJ {cnpj} → {supplier_status}")
     return {"supplier_status": supplier_status}
 
 
 def manager_approval(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 5 — Solicita aprovação do gerente via interrupt().
-    Aguarda 'approved' ou qualquer outra resposta (tratada como 'rejected').
-    """
     print("\n[NODE] manager_approval")
-
     data = state["contract_data"]
     valor = float(data.get("valor_total") or 0)
-    valor_fmt = f"{data.get('moeda', 'BRL')} {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    moeda = data.get("moeda", "BRL")
+    valor_fmt = f"{moeda} {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     def _f(key: str, default: str = "Não informado") -> str:
         return str(data.get(key) or default)
 
+    try:
+        pontos: list[str] = json.loads(state.get("pontos_atencao") or "[]")
+    except Exception:
+        pontos = []
+
     summary = (
         "=== SOLICITACAO DE APROVACAO DE PO ===\n"
+        f"  Categoria    : {state.get('tipo_regularizacao', 'N/A')}\n"
         f"  Fornecedor   : {_f('razao_social')}\n"
         f"  CNPJ         : {_f('cnpj')}\n"
         f"  Pais         : {_f('fornecedor_pais')}\n"
@@ -509,35 +530,26 @@ def manager_approval(state: AgentState) -> dict[str, Any]:
         f"  Vigencia     : {_f('data_inicio')} ate {_f('data_termino')}\n"
         f"  Pagamento    : {_f('condicao_pagamento')} / {_f('frequencia_pagamento')}\n"
         f"  Escopo       : {_f('escopo')}\n"
-        f"  Assinaturas  : {_f('assinaturas')}\n"
+        f"  Assinaturas  : {_f('assinaturas')} (OK: {state.get('assinaturas_ok')})\n"
         + (f"  [ALERTA PJ] {data['alerta_pj']}\n" if data.get("alerta_pj") else "")
+        + ("  Pontos de Atencao:\n" + "\n".join(f"    - {p}" for p in pontos) + "\n" if pontos else "")
         + "======================================\n"
-        "Digite 'approved' para aprovar ou qualquer outra coisa para rejeitar."
+        "APROVACAO"
     )
-    print(f"\n{summary}")
-
     decision: str = interrupt(summary)
     approval_status = "approved" if decision.strip().lower() == "approved" else "rejected"
     print(f"  Decisão: {approval_status}")
-
     return {
         "approval_status": approval_status,
-        "messages": [
-            AIMessage(content=summary),
-            HumanMessage(content=decision),
-        ],
+        "messages": [AIMessage(content=summary), HumanMessage(content=decision)],
     }
 
 
 def create_po(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 6 — Grava a Purchase Order no SQLite e notifica o solicitante.
-    """
     print("\n[NODE] create_po")
-
     data = state["contract_data"]
-
-    pdf_filename = os.path.basename(state.get("pdf_path") or "")
+    pdf_paths = state.get("pdf_paths") or []
+    pdf_filename = ",".join(os.path.basename(p) for p in pdf_paths) if pdf_paths else ""
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
@@ -547,9 +559,10 @@ def create_po(state: AgentState) -> dict[str, Any]:
                  condicao_pagamento, status, pdf_url, criado_por, criado_por_email, thread_url,
                  moeda, data_inicio, data_termino, descricao_itens, escopo,
                  contratante_nome, contratante_cnpj, fornecedor_pais, alerta_pj,
-                 contato_nome, contato_email, frequencia_pagamento, assinaturas)
+                 contato_nome, contato_email, frequencia_pagamento, assinaturas,
+                 tipo_regularizacao, assinaturas_ok, pontos_atencao, documentos_identificados)
             VALUES (?, ?, ?, ?, 0, ?, 'Pendente validação', ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "PO-TMP",
@@ -574,62 +587,46 @@ def create_po(state: AgentState) -> dict[str, Any]:
                 data.get("contato_email"),
                 data.get("frequencia_pagamento"),
                 data.get("assinaturas"),
+                state.get("tipo_regularizacao"),
+                1 if state.get("assinaturas_ok") else 0,
+                state.get("pontos_atencao"),
+                state.get("documentos_identificados"),
             ),
         )
         row_id = cursor.lastrowid
         po_id = f"PO-{row_id:06d}"
-        conn.execute(
-            "UPDATE purchase_orders SET numero_po = ? WHERE id = ?",
-            (po_id, row_id),
-        )
+        conn.execute("UPDATE purchase_orders SET numero_po = ? WHERE id = ?", (po_id, row_id))
 
     confirmation = (
         f"Purchase Order criada com sucesso!\n"
-        f"  ID    : {po_id}\n"
-        f"  CNPJ  : {data['cnpj']}\n"
-        f"  Valor : R$ {float(data['valor_total']):,.2f}"
+        f"  ID       : {po_id}\n"
+        f"  Categoria: {state.get('tipo_regularizacao', 'N/A')}\n"
+        f"  CNPJ     : {data.get('cnpj')}\n"
+        f"  Valor    : {data.get('moeda', 'BRL')} {float(data.get('valor_total') or 0):,.2f}"
     )
     print(f"  {confirmation}")
-
-    return {
-        "po_id": po_id,
-        "messages": [AIMessage(content=confirmation)],
-    }
+    return {"po_id": po_id, "messages": [AIMessage(content=confirmation)]}
 
 
 def procurement_fallback(state: AgentState) -> dict[str, Any]:
-    """
-    Nó 7 — Tratativa de rejeição ou bloqueio. Sempre terminal (→ END).
-    """
     print("\n[NODE] procurement_fallback")
-
     if state.get("supplier_status") == "blocked":
-        reason = (
-            f"Fornecedor com CNPJ {state['contract_data'].get('cnpj')} "
-            "está bloqueado no sistema. Caso encaminhado ao time de Compliance."
-        )
+        reason = f"Fornecedor CNPJ {state['contract_data'].get('cnpj')} está bloqueado. Caso encaminhado ao Compliance."
     else:
-        reason = (
-            f"Solicitação rejeitada pelo gerente "
-            f"(status: {state.get('approval_status', 'desconhecido')})."
-        )
-
+        reason = f"Solicitação rejeitada pelo gerente (status: {state.get('approval_status', 'desconhecido')})."
     message = f"Fluxo encerrado — caso encaminhado para análise humana.\nMotivo: {reason}"
-    print(f"  {message}")
-
-    return {
-        "error_message": reason,
-        "messages": [AIMessage(content=message)],
-    }
+    return {"error_message": reason, "messages": [AIMessage(content=message)]}
 
 
 # ==============================================================================
-# ROUTING (Conditional Edges)
+# ROUTING
 # ==============================================================================
 
 def route_after_extraction(
     state: AgentState,
-) -> Literal["human_in_the_loop_missing_info", "check_supplier"]:
+) -> Literal["discard_documents", "human_in_the_loop_missing_info", "check_supplier"]:
+    if state.get("is_discarded"):
+        return "discard_documents"
     if state["missing_fields"]:
         return "human_in_the_loop_missing_info"
     return "check_supplier"
@@ -665,46 +662,43 @@ def route_after_approval(
 
 def build_graph():
     """
-    Monta e compila o grafo com MemorySaver como checkpointer.
-
-    O MemorySaver persiste o AgentState entre chamadas quando o grafo
-    é pausado por interrupt(), permitindo que o fluxo retome exatamente
-    de onde parou sem perder nenhum dado já coletado.
-
     Fluxo:
         START → receive_input_and_document
-              → extract_and_validate_data ←────────────────────────┐
-                    ├─(faltando)→ human_in_the_loop_missing_info ──┘
-                    └─(completo)→ check_supplier
-                                    ├─(blocked)→ procurement_fallback → END
-                                    └─(ok)─────→ manager_approval
-                                                    ├─(rejected)→ procurement_fallback → END
-                                                    └─(approved)→ create_po → END
+              → extract_and_validate_data ←──────────────────────────────────┐
+                    ├─(descarte)──→ discard_documents → END                  │
+                    ├─(faltando)──→ human_in_the_loop_missing_info ──────────┘
+                    └─(completo)──→ check_supplier
+                                        ├─(blocked)→ procurement_fallback → END
+                                        └─(ok)─────→ confirm_with_requester (pro-forma)
+                                                          ├─(confirmed)→ manager_approval
+                                                          │                ├─(approved)→ create_po → END
+                                                          │                └─(rejected)→ procurement_fallback → END
+                                                          └─(edit)──────→ extract_and_validate_data
     """
     builder = StateGraph(AgentState)
 
-    # Nodes
     builder.add_node("receive_input_and_document", receive_input_and_document)
     builder.add_node("extract_and_validate_data", extract_and_validate_data)
     builder.add_node("human_in_the_loop_missing_info", human_in_the_loop_missing_info)
+    builder.add_node("discard_documents", discard_documents)
     builder.add_node("check_supplier", check_supplier)
     builder.add_node("confirm_with_requester", confirm_with_requester)
     builder.add_node("manager_approval", manager_approval)
     builder.add_node("create_po", create_po)
     builder.add_node("procurement_fallback", procurement_fallback)
 
-    # Edges diretos
     builder.add_edge(START, "receive_input_and_document")
     builder.add_edge("receive_input_and_document", "extract_and_validate_data")
     builder.add_edge("human_in_the_loop_missing_info", "extract_and_validate_data")
+    builder.add_edge("discard_documents", END)
     builder.add_edge("create_po", END)
     builder.add_edge("procurement_fallback", END)
 
-    # Conditional edges
     builder.add_conditional_edges(
         "extract_and_validate_data",
         route_after_extraction,
         {
+            "discard_documents": "discard_documents",
             "human_in_the_loop_missing_info": "human_in_the_loop_missing_info",
             "check_supplier": "check_supplier",
         },
@@ -712,26 +706,17 @@ def build_graph():
     builder.add_conditional_edges(
         "check_supplier",
         route_after_supplier_check,
-        {
-            "confirm_with_requester": "confirm_with_requester",
-            "procurement_fallback": "procurement_fallback",
-        },
+        {"confirm_with_requester": "confirm_with_requester", "procurement_fallback": "procurement_fallback"},
     )
     builder.add_conditional_edges(
         "confirm_with_requester",
         route_after_confirmation,
-        {
-            "manager_approval": "manager_approval",
-            "extract_and_validate_data": "extract_and_validate_data",
-        },
+        {"manager_approval": "manager_approval", "extract_and_validate_data": "extract_and_validate_data"},
     )
     builder.add_conditional_edges(
         "manager_approval",
         route_after_approval,
-        {
-            "create_po": "create_po",
-            "procurement_fallback": "procurement_fallback",
-        },
+        {"create_po": "create_po", "procurement_fallback": "procurement_fallback"},
     )
 
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "langgraph.db")
@@ -741,27 +726,22 @@ def build_graph():
 
 
 # ==============================================================================
-# ENTRY POINT — execução interativa no terminal
+# ENTRY POINT — terminal interativo
 # ==============================================================================
 
 def run_interactive() -> None:
-    """Loop de teste no terminal: submissão → cobrança de dados → aprovação → PO."""
     from langgraph.types import Command
-
     graph = build_graph()
-
     print("\n" + "=" * 60)
-    print(" SISTEMA DE PROCUREMENT — MVP")
+    print(" SISTEMA DE PROCUREMENT — Regularização e Parcerias VTEX")
     print("=" * 60)
-
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
-
-    user_request = input("\nDescreva sua solicitação de compra:\n> ").strip()
-    contract_text = input("\nCole o texto do contrato (Enter para usar só a solicitação):\n> ").strip()
-
+    user_request = input("\nDescreva sua solicitação:\n> ").strip()
+    contract_text = input("\nCole o texto do contrato (Enter para pular):\n> ").strip()
     initial_state: AgentState = {
         "messages": [],
         "user_request": user_request,
+        "pdf_paths": [],
         "contract_text": contract_text or user_request,
         "contract_data": {},
         "missing_fields": [],
@@ -770,31 +750,29 @@ def run_interactive() -> None:
         "approval_status": None,
         "po_id": None,
         "error_message": None,
+        "is_discarded": False,
+        "tipo_regularizacao": None,
+        "assinaturas_ok": None,
+        "pontos_atencao": None,
+        "documentos_identificados": None,
     }
-
     graph.invoke(initial_state, config=config)
-
-    # Loop de resume para cada interrupt()
     while True:
         state = graph.get_state(config)
         if not state.next:
             break
-
-        interrupts = state.tasks[0].interrupts if state.tasks else []
+        interrupts = list(state.interrupts) if state.interrupts else []
+        if not interrupts and state.tasks:
+            interrupts = list(state.tasks[0].interrupts)
         if not interrupts:
             break
-
-        print(f"\n{'─' * 60}")
-        print(f"[AGUARDANDO INPUT]\n{interrupts[0].value}")
+        print(f"\n{'─' * 60}\n[AGUARDANDO INPUT]\n{interrupts[0].value}")
         user_input = input("\n> ").strip()
-
         graph.invoke(Command(resume=user_input), config=config)
-
-    # Resultado final
     final = graph.get_state(config).values
     print("\n" + "=" * 60)
     if final.get("po_id"):
-        print(f"CONCLUÍDO — PO gerada: {final['po_id']}")
+        print(f"CONCLUÍDO — PO: {final['po_id']}")
     else:
         print(f"ENCERRADO — {final.get('error_message', 'Fluxo finalizado.')}")
     print("=" * 60)
