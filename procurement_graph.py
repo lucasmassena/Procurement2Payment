@@ -19,6 +19,9 @@ if sys.stdout.isatty() and hasattr(sys.stdout, "buffer"):
 if sys.stderr.isatty() and hasattr(sys.stderr, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import pdfplumber
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -34,8 +37,8 @@ from typing_extensions import TypedDict
 # CONFIGURAÇÃO
 # ==============================================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "GEMINI_KEY_REMOVED")
-MODEL = "gemini-2.0-flash"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL = "gemini-2.5-flash"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "procurement.db")
 
